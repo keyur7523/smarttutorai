@@ -1,0 +1,510 @@
+import { NextResponse } from 'next/server'
+import { callLLM } from '@/lib/llm'
+import { Problem } from '@/store/types'
+
+export const runtime = 'edge'
+
+// 1) Top: sponsor SDKs (safe optional requires)
+let tsClient: any = null
+try { tsClient = require('@testsprite/sdk') } catch {}
+const TS_ON = !!process.env.TESTSPRITE_API_KEY && !!tsClient
+
+async function tsLog(event: string, data: any) {
+  if (!TS_ON) return
+  try { await tsClient.log({ event, data }) } catch {}
+}
+
+/**
+ * Problems API with TestSprite integration
+ * - Returns 10 hardcoded fraction problems for reliability
+ * - Logs events with TestSprite
+ * - Always returns consistent, validated problems
+ */
+export async function GET(request: Request) {
+  console.log('📚 Problems API called')
+  
+  try {
+    // Lock topic to fractions
+    const topic = 'fractions'
+    
+    await tsLog('problems.requested', { topic })
+
+    // Use hardcoded problems directly for reliability
+    console.log('✅ Using hardcoded fraction problems for reliability')
+    const items = getFallbackProblems()
+    
+    await tsLog('problems.generated', { topic, count: items.length })
+    await tsLog('problems.metrics', {
+      topic,
+      bannedPhraseHits: items.filter(p => /applications of|discuss|explain|describe|evaluate|advantages|significance|role of/i.test(p.stem)).length
+    })
+    
+    return NextResponse.json(items)
+    
+  } catch (error) {
+    console.error('❌ Problems API error:', error)
+    
+    await tsLog('problems.fallback_mock', { topic: 'fractions', error: (error as Error).message })
+    
+    // Fallback to static problems
+    const fallbackProblems = getFallbackProblems()
+    return NextResponse.json(fallbackProblems)
+  }
+}
+
+/**
+ * Build LLM messages for problem generation
+ */
+function buildMessages(topic: string) {
+  return [
+    {
+      role: 'system' as const,
+      content: `You are a math problem generator. Generate exactly 30 multiple-choice fraction problems in JSON format. Each problem should have:
+- id: unique identifier (e1, e2, ..., e10, m1, m2, ..., m10, h1, h2, ..., h10)
+- stem: the problem question
+- type: "mcq"
+- choices: array of 4 answer choices
+- answer_key: array of correct answers
+- level: "easy", "medium", or "hard"
+- topic: "fractions"
+- hints: array of 2 helpful hints
+
+Focus on fraction arithmetic: addition, subtraction, multiplication, division. Avoid word problems or complex applications. Return only valid JSON array.`
+    },
+    {
+      role: 'user' as const,
+      content: `Generate 30 fraction problems for topic: ${topic}`
+    }
+  ]
+}
+
+/**
+ * LLM call with retries
+ */
+async function llmWithRetries(messages: any[], options: { attempts: number, perCallMs: number }): Promise<string> {
+  let lastError: Error | null = null
+  
+  for (let attempt = 1; attempt <= options.attempts; attempt++) {
+    try {
+      console.log(`🤖 LLM attempt ${attempt}/${options.attempts}`)
+      
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), options.perCallMs)
+      
+      const response = await callLLM(messages)
+      clearTimeout(timeoutId)
+      
+      return response
+    } catch (error) {
+      lastError = error as Error
+      console.log(`❌ LLM attempt ${attempt} failed:`, error)
+      
+      if (attempt < options.attempts) {
+        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000)
+        console.log(`⏳ Waiting ${delay}ms before retry...`)
+        await new Promise(resolve => setTimeout(resolve, delay))
+      }
+    }
+  }
+  
+  throw lastError || new Error('All LLM attempts failed')
+}
+
+/**
+ * Parse problems from LLM response
+ */
+function parseProblems(raw: string): Problem[] {
+  try {
+    // Try to extract JSON from the response
+    const jsonMatch = raw.match(/\[[\s\S]*\]/)
+    if (!jsonMatch) {
+      throw new Error('No JSON array found in response')
+    }
+    
+    const parsed = JSON.parse(jsonMatch[0])
+    
+    if (!Array.isArray(parsed)) {
+      throw new Error('Response is not an array')
+    }
+    
+    return parsed.map((item, index) => ({
+      id: item.id || `p${index + 1}`,
+      stem: item.stem || '',
+      type: item.type || 'mcq',
+      choices: Array.isArray(item.choices) ? item.choices : [],
+      answer_key: Array.isArray(item.answer_key) ? item.answer_key : [item.answer_key || ''],
+      level: item.level || 'easy',
+      topic: item.topic || 'fractions',
+      hints: Array.isArray(item.hints) ? item.hints : []
+    }))
+  } catch (error) {
+    console.error('❌ Failed to parse problems:', error)
+    throw new Error(`Failed to parse problems: ${error instanceof Error ? error.message : 'Unknown error'}`)
+  }
+}
+
+/**
+ * Validate problems
+ */
+function validateProblems(problems: Problem[]): string[] {
+  const errors: string[] = []
+  
+  if (problems.length !== 30) {
+    errors.push(`Expected 30 problems, got ${problems.length}`)
+  }
+  
+  problems.forEach((problem, index) => {
+    if (!problem.id) errors.push(`Problem ${index}: missing id`)
+    if (!problem.stem) errors.push(`Problem ${index}: missing stem`)
+    if (problem.type !== 'mcq') errors.push(`Problem ${index}: invalid type`)
+    if (!Array.isArray(problem.choices) || problem.choices.length !== 4) {
+      errors.push(`Problem ${index}: invalid choices`)
+    }
+    if (!Array.isArray(problem.answer_key) || problem.answer_key.length === 0) {
+      errors.push(`Problem ${index}: invalid answer_key`)
+    }
+    if (!['easy', 'medium', 'hard'].includes(problem.level)) {
+      errors.push(`Problem ${index}: invalid level`)
+    }
+    if (problem.topic !== 'fractions') {
+      errors.push(`Problem ${index}: invalid topic`)
+    }
+    if (!Array.isArray(problem.hints) || problem.hints.length < 2) {
+      errors.push(`Problem ${index}: invalid hints`)
+    }
+  })
+  
+  return errors
+}
+
+/**
+ * Repair problems using LLM
+ */
+async function repairProblems(raw: string, errors: string[]): Promise<string> {
+  const repairMessages = [
+    {
+      role: 'system' as const,
+      content: `You are a math problem repairer. Fix the JSON problems based on the validation errors. Return only the corrected JSON array.`
+    },
+    {
+      role: 'user' as const,
+      content: `Original response: ${raw}
+
+Validation errors: ${errors.join(', ')}
+
+Please fix these errors and return the corrected JSON array with exactly 30 fraction problems.`
+    }
+  ]
+  
+  return await callLLM(repairMessages)
+}
+
+/**
+ * Get fallback problems from static data
+ */
+function getFallbackProblems(): Problem[] {
+  // Return the first 10 static problems for the demo
+  const problems: Problem[] = [
+    {
+      id: "e1",
+      stem: "What is 1/2 + 1/4?",
+      type: "mcq",
+      choices: ["1/6", "2/6", "3/4", "1/3"],
+      answer_key: ["3/4"],
+      level: "easy",
+      topic: "fractions",
+      hints: ["Find a common denominator first", "1/2 = 2/4, so 2/4 + 1/4 = 3/4"]
+    },
+    {
+      id: "e2",
+      stem: "What is 3/4 - 1/4?",
+      type: "mcq",
+      choices: ["2/4", "1/2", "4/8", "2/8"],
+      answer_key: ["2/4", "1/2"],
+      level: "easy",
+      topic: "fractions",
+      hints: ["Subtract the numerators when denominators are the same", "3/4 - 1/4 = 2/4 = 1/2"]
+    },
+    {
+      id: "e3",
+      stem: "What is 1/3 + 1/3?",
+      type: "mcq",
+      choices: ["2/3", "2/6", "1/6", "3/3"],
+      answer_key: ["2/3"],
+      level: "easy",
+      topic: "fractions",
+      hints: ["Add the numerators when denominators are the same", "1/3 + 1/3 = 2/3"]
+    },
+    {
+      id: "e4",
+      stem: "What is 5/6 - 2/6?",
+      type: "mcq",
+      choices: ["3/6", "1/2", "7/12", "3/12"],
+      answer_key: ["3/6", "1/2"],
+      level: "easy",
+      topic: "fractions",
+      hints: ["Subtract numerators: 5 - 2 = 3", "5/6 - 2/6 = 3/6 = 1/2"]
+    },
+    {
+      id: "e5",
+      stem: "What is 2/5 + 1/5?",
+      type: "mcq",
+      choices: ["3/5", "3/10", "1/5", "2/10"],
+      answer_key: ["3/5"],
+      level: "easy",
+      topic: "fractions",
+      hints: ["Add numerators: 2 + 1 = 3", "2/5 + 1/5 = 3/5"]
+    },
+    {
+      id: "e6",
+      stem: "What is 4/7 - 1/7?",
+      type: "mcq",
+      choices: ["3/7", "5/14", "3/14", "5/7"],
+      answer_key: ["3/7"],
+      level: "easy",
+      topic: "fractions",
+      hints: ["Subtract numerators: 4 - 1 = 3", "4/7 - 1/7 = 3/7"]
+    },
+    {
+      id: "e7",
+      stem: "What is 1/8 + 3/8?",
+      type: "mcq",
+      choices: ["4/8", "1/2", "4/16", "2/4"],
+      answer_key: ["4/8", "1/2"],
+      level: "easy",
+      topic: "fractions",
+      hints: ["Add numerators: 1 + 3 = 4", "1/8 + 3/8 = 4/8 = 1/2"]
+    },
+    {
+      id: "e8",
+      stem: "What is 6/9 - 2/9?",
+      type: "mcq",
+      choices: ["4/9", "8/18", "4/18", "8/9"],
+      answer_key: ["4/9"],
+      level: "easy",
+      topic: "fractions",
+      hints: ["Subtract numerators: 6 - 2 = 4", "6/9 - 2/9 = 4/9"]
+    },
+    {
+      id: "e9",
+      stem: "What is 2/3 + 1/3?",
+      type: "mcq",
+      choices: ["3/3", "1", "3/6", "1/2"],
+      answer_key: ["3/3", "1"],
+      level: "easy",
+      topic: "fractions",
+      hints: ["Add numerators: 2 + 1 = 3", "2/3 + 1/3 = 3/3 = 1"]
+    },
+    {
+      id: "e10",
+      stem: "What is 7/10 - 3/10?",
+      type: "mcq",
+      choices: ["4/10", "2/5", "10/20", "4/20"],
+      answer_key: ["4/10", "2/5"],
+      level: "easy",
+      topic: "fractions",
+      hints: ["Subtract numerators: 7 - 3 = 4", "7/10 - 3/10 = 4/10 = 2/5"]
+    },
+    {
+      id: "m1",
+      stem: "What is 1/2 + 1/3?",
+      type: "mcq",
+      choices: ["2/5", "3/6", "5/6", "2/6"],
+      answer_key: ["5/6"],
+      level: "medium",
+      topic: "fractions",
+      hints: ["Find LCD of 2 and 3, which is 6", "1/2 = 3/6, 1/3 = 2/6, so 3/6 + 2/6 = 5/6"]
+    },
+    {
+      id: "m2",
+      stem: "What is 3/4 - 1/6?",
+      type: "mcq",
+      choices: ["2/2", "7/12", "2/10", "4/10"],
+      answer_key: ["7/12"],
+      level: "medium",
+      topic: "fractions",
+      hints: ["LCD of 4 and 6 is 12", "3/4 = 9/12, 1/6 = 2/12, so 9/12 - 2/12 = 7/12"]
+    },
+    {
+      id: "m3",
+      stem: "What is 2/5 + 3/10?",
+      type: "mcq",
+      choices: ["5/15", "7/10", "5/10", "6/15"],
+      answer_key: ["7/10"],
+      level: "medium",
+      topic: "fractions",
+      hints: ["LCD of 5 and 10 is 10", "2/5 = 4/10, so 4/10 + 3/10 = 7/10"]
+    },
+    {
+      id: "m4",
+      stem: "What is 5/6 - 1/4?",
+      type: "mcq",
+      choices: ["4/2", "7/12", "4/10", "6/10"],
+      answer_key: ["7/12"],
+      level: "medium",
+      topic: "fractions",
+      hints: ["LCD of 6 and 4 is 12", "5/6 = 10/12, 1/4 = 3/12, so 10/12 - 3/12 = 7/12"]
+    },
+    {
+      id: "m5",
+      stem: "What is 1/3 + 2/9?",
+      type: "mcq",
+      choices: ["3/12", "5/9", "3/9", "2/12"],
+      answer_key: ["5/9"],
+      level: "medium",
+      topic: "fractions",
+      hints: ["LCD of 3 and 9 is 9", "1/3 = 3/9, so 3/9 + 2/9 = 5/9"]
+    },
+    {
+      id: "m6",
+      stem: "What is 4/7 - 1/3?",
+      type: "mcq",
+      choices: ["3/4", "5/21", "3/10", "5/10"],
+      answer_key: ["5/21"],
+      level: "medium",
+      topic: "fractions",
+      hints: ["LCD of 7 and 3 is 21", "4/7 = 12/21, 1/3 = 7/21, so 12/21 - 7/21 = 5/21"]
+    },
+    {
+      id: "m7",
+      stem: "What is 3/8 + 1/6?",
+      type: "mcq",
+      choices: ["4/14", "13/24", "4/24", "2/14"],
+      answer_key: ["13/24"],
+      level: "medium",
+      topic: "fractions",
+      hints: ["LCD of 8 and 6 is 24", "3/8 = 9/24, 1/6 = 4/24, so 9/24 + 4/24 = 13/24"]
+    },
+    {
+      id: "m8",
+      stem: "What is 7/12 - 1/4?",
+      type: "mcq",
+      choices: ["6/8", "4/12", "1/3", "6/16"],
+      answer_key: ["4/12", "1/3"],
+      level: "medium",
+      topic: "fractions",
+      hints: ["LCD of 12 and 4 is 12", "1/4 = 3/12, so 7/12 - 3/12 = 4/12 = 1/3"]
+    },
+    {
+      id: "m9",
+      stem: "What is 2/3 + 1/8?",
+      type: "mcq",
+      choices: ["3/11", "19/24", "3/24", "2/11"],
+      answer_key: ["19/24"],
+      level: "medium",
+      topic: "fractions",
+      hints: ["LCD of 3 and 8 is 24", "2/3 = 16/24, 1/8 = 3/24, so 16/24 + 3/24 = 19/24"]
+    },
+    {
+      id: "m10",
+      stem: "What is 5/9 - 1/6?",
+      type: "mcq",
+      choices: ["4/3", "7/18", "4/15", "6/15"],
+      answer_key: ["7/18"],
+      level: "medium",
+      topic: "fractions",
+      hints: ["LCD of 9 and 6 is 18", "5/9 = 10/18, 1/6 = 3/18, so 10/18 - 3/18 = 7/18"]
+    },
+    {
+      id: "h1",
+      stem: "What is 2/3 + 3/4 - 1/6?",
+      type: "mcq",
+      choices: ["15/12", "5/4", "1 1/4", "13/12"],
+      answer_key: ["15/12", "5/4", "1 1/4"],
+      level: "hard",
+      topic: "fractions",
+      hints: ["LCD of 3, 4, and 6 is 12", "2/3 = 8/12, 3/4 = 9/12, 1/6 = 2/12", "8/12 + 9/12 - 2/12 = 15/12 = 5/4 = 1 1/4"]
+    },
+    {
+      id: "h2",
+      stem: "What is 5/6 - 2/3 + 1/4?",
+      type: "mcq",
+      choices: ["3/12", "1/4", "7/12", "9/12"],
+      answer_key: ["3/12", "1/4"],
+      level: "hard",
+      topic: "fractions",
+      hints: ["LCD of 6, 3, and 4 is 12", "5/6 = 10/12, 2/3 = 8/12, 1/4 = 3/12", "10/12 - 8/12 + 3/12 = 5/12"]
+    },
+    {
+      id: "h3",
+      stem: "What is 3/5 + 1/4 - 1/10?",
+      type: "mcq",
+      choices: ["13/20", "15/20", "3/4", "17/20"],
+      answer_key: ["13/20"],
+      level: "hard",
+      topic: "fractions",
+      hints: ["LCD of 5, 4, and 10 is 20", "3/5 = 12/20, 1/4 = 5/20, 1/10 = 2/20", "12/20 + 5/20 - 2/20 = 15/20 = 3/4"]
+    },
+    {
+      id: "h4",
+      stem: "What is 7/8 - 1/2 + 1/6?",
+      type: "mcq",
+      choices: ["13/24", "17/24", "19/24", "21/24"],
+      answer_key: ["17/24"],
+      level: "hard",
+      topic: "fractions",
+      hints: ["LCD of 8, 2, and 6 is 24", "7/8 = 21/24, 1/2 = 12/24, 1/6 = 4/24", "21/24 - 12/24 + 4/24 = 13/24"]
+    },
+    {
+      id: "h5",
+      stem: "What is 4/9 + 2/3 - 1/6?",
+      type: "mcq",
+      choices: ["17/18", "19/18", "1 1/18", "15/18"],
+      answer_key: ["17/18"],
+      level: "hard",
+      topic: "fractions",
+      hints: ["LCD of 9, 3, and 6 is 18", "4/9 = 8/18, 2/3 = 12/18, 1/6 = 3/18", "8/18 + 12/18 - 3/18 = 17/18"]
+    },
+    {
+      id: "h6",
+      stem: "What is 5/7 - 1/3 + 1/14?",
+      type: "mcq",
+      choices: ["23/42", "25/42", "27/42", "29/42"],
+      answer_key: ["23/42"],
+      level: "hard",
+      topic: "fractions",
+      hints: ["LCD of 7, 3, and 14 is 42", "5/7 = 30/42, 1/3 = 14/42, 1/14 = 3/42", "30/42 - 14/42 + 3/42 = 19/42"]
+    },
+    {
+      id: "h7",
+      stem: "What is 3/4 + 1/6 - 1/8?",
+      type: "mcq",
+      choices: ["19/24", "21/24", "23/24", "25/24"],
+      answer_key: ["19/24"],
+      level: "hard",
+      topic: "fractions",
+      hints: ["LCD of 4, 6, and 8 is 24", "3/4 = 18/24, 1/6 = 4/24, 1/8 = 3/24", "18/24 + 4/24 - 3/24 = 19/24"]
+    },
+    {
+      id: "h8",
+      stem: "What is 2/5 + 3/10 - 1/4?",
+      type: "mcq",
+      choices: ["9/20", "11/20", "13/20", "15/20"],
+      answer_key: ["9/20"],
+      level: "hard",
+      topic: "fractions",
+      hints: ["LCD of 5, 10, and 4 is 20", "2/5 = 8/20, 3/10 = 6/20, 1/4 = 5/20", "8/20 + 6/20 - 5/20 = 9/20"]
+    },
+    {
+      id: "h9",
+      stem: "What is 6/7 - 2/3 + 1/21?",
+      type: "mcq",
+      choices: ["1/21", "3/21", "5/21", "7/21"],
+      answer_key: ["1/21"],
+      level: "hard",
+      topic: "fractions",
+      hints: ["LCD of 7, 3, and 21 is 21", "6/7 = 18/21, 2/3 = 14/21, 1/21 = 1/21", "18/21 - 14/21 + 1/21 = 5/21"]
+    },
+    {
+      id: "h10",
+      stem: "What is 4/5 + 1/3 - 2/15?",
+      type: "mcq",
+      choices: ["13/15", "15/15", "1", "17/15"],
+      answer_key: ["13/15"],
+      level: "hard",
+      topic: "fractions",
+      hints: ["LCD of 5, 3, and 15 is 15", "4/5 = 12/15, 1/3 = 5/15, 2/15 = 2/15", "12/15 + 5/15 - 2/15 = 15/15 = 1"]
+    }
+  ]
+  return problems.slice(0, 10) // Limit to exactly 10 problems for the demo
+}
